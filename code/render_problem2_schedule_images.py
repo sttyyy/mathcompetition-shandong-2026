@@ -58,6 +58,19 @@ def read_csv_utf8(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, encoding="utf-8-sig")
 
 
+def latest_baseline_itinerary_path() -> Path:
+    """Return the newest baseline itinerary CSV, including timestamped fallback files."""
+
+    candidates = sorted(
+        PROCESSED_DIR.glob("problem2_baseline_itinerary*.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError("??? problem2_baseline_itinerary*.csv?????????????")
+    return candidates[0]
+
+
 def render_itinerary_overview(itinerary: pd.DataFrame) -> Path:
     """Render a compact overview table for the 5-day baseline itinerary."""
 
@@ -207,7 +220,8 @@ def main() -> None:
     setup_style()
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
 
-    itinerary = read_csv_utf8(PROCESSED_DIR / "problem2_baseline_itinerary.csv")
+    itinerary_path = latest_baseline_itinerary_path()
+    itinerary = read_csv_utf8(itinerary_path)
     timeline = read_csv_utf8(PROCESSED_DIR / "problem2_baseline_timeline.csv")
 
     overview_path = render_itinerary_overview(itinerary)

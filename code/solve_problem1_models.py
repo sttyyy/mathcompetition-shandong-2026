@@ -254,8 +254,9 @@ class FuzzyCMeans:
         u = u / np.sum(u, axis=1, keepdims=True)
 
         for _ in range(self.max_iter):
-            centers = (u.T @ x) / (u.T @ np.ones((n_samples, 1)) + 1e-12)
-            dist = pairwise_distance(x, centers) ** 2
+            um = u ** self.m
+            centers = (um.T @ x) / (um.sum(axis=0)[:, np.newaxis] + 1e-12)
+            dist = pairwise_distance(x, centers)
             dist = np.maximum(dist, 1e-12)
             new_u = 1.0 / np.sum((dist[:, :, np.newaxis] / dist[:, np.newaxis, :]) ** (2 / (self.m - 1)), axis=2)
             if np.linalg.norm(new_u - u) < self.tol:
@@ -441,34 +442,57 @@ def plot_results(
     return out_path
 
 
-def sensitivity_and_validity(norm_data: np.ndarray, w_comb: np.ndarray, df_topsis: pd.DataFrame, fcm: FuzzyCMeans) -> tuple[pd.DataFrame, float]:
+def sensitivity_and_validity(
+    norm_data: np.ndarray,
+    w_comb: np.ndarray,
+    df_topsis: pd.DataFrame,
+    fcm: FuzzyCMeans,
+    cols: list[str],
+) -> tuple[pd.DataFrame, float, pd.DataFrame]:
     """Step 10: weight-sensitivity and cluster-validity analysis."""
 
     print("\n步骤10：权重敏感性分析")
     delta_range = np.linspace(-0.2, 0.2, 5)
-    # Use the same attraction order for original and perturbed TOPSIS results.
-    original_rank = rankdata(topsis(norm_data, w_comb))
+    base_closeness = topsis(norm_data, w_comb)
+    # Negative closeness converts larger-is-better scores into smaller rank numbers.
+    original_rank = rankdata(-base_closeness)
     rows = []
-    for delta in delta_range:
-        w_perturb = w_comb * (1 + delta)
-        w_perturb = w_perturb / np.sum(w_perturb)
-        new_closeness = topsis(norm_data, w_perturb)
-        new_rank = rankdata(new_closeness)
-        rho = spearman_corr(original_rank, new_rank)
-        rows.append({"扰动幅度": delta, "Spearman秩相关系数": rho})
+    for indicator_index, indicator_name in enumerate(cols):
+        for delta in delta_range:
+            w_perturb = w_comb.copy()
+            w_perturb[indicator_index] = max(w_perturb[indicator_index] * (1 + delta), 1e-12)
+            w_perturb = w_perturb / np.sum(w_perturb)
+            new_closeness = topsis(norm_data, w_perturb)
+            new_rank = rankdata(-new_closeness)
+            rho = spearman_corr(original_rank, new_rank)
+            max_rank_change = float(np.max(np.abs(new_rank - original_rank)))
+            rows.append(
+                {
+                    "扰动指标": indicator_name,
+                    "扰动幅度": delta,
+                    "Spearman秩相关系数": rho,
+                    "最大名次变化": max_rank_change,
+                }
+            )
 
     sensitivity_df = pd.DataFrame(rows)
-    print("权重扰动幅度 ±20% 时的Spearman秩相关系数：")
-    for row in sensitivity_df.itertuples(index=False):
-        print(f"  扰动 {row.扰动幅度*100:+.0f}% : ρ = {row.Spearman秩相关系数:.4f}")
+    print("逐指标权重扰动 ±20% 时的Spearman秩相关系数：")
+    summary = sensitivity_df.groupby("扰动指标").agg(
+        最小秩相关系数=("Spearman秩相关系数", "min"),
+        最大名次变化=("最大名次变化", "max"),
+    )
+    print(summary.round(4))
     if sensitivity_df["Spearman秩相关系数"].min() > 0.95:
         print("所有ρ > 0.95，排名高度稳定。")
     else:
         print("存在ρ ≤ 0.95 的扰动情形，需关注排序稳定性。")
 
     eta = cluster_validity(norm_data, fcm.U, fcm.centers_)
-    print(f"\n聚类有效性指标 η = {eta:.3f}（越大越好）")
-    return sensitivity_df, eta
+    validity_df = cluster_validity_scan(norm_data)
+    print(f"\n当前K=4聚类有效性指标 η = {eta:.3f}（越大越好）")
+    print("不同聚类数K的有效性比较：")
+    print(validity_df.round(4).to_string(index=False))
+    return sensitivity_df, eta, validity_df
 
 
 def cluster_validity(x: np.ndarray, u: np.ndarray, centers: np.ndarray, m: float = 2) -> float:
@@ -479,12 +503,33 @@ def cluster_validity(x: np.ndarray, u: np.ndarray, centers: np.ndarray, m: float
         for k in range(centers.shape[0]):
             within += (u[i, k] ** m) * np.sum((x[i] - centers[k]) ** 2)
 
-    between = 0.0
+    between_values = []
     for r in range(centers.shape[0]):
-        for s in range(centers.shape[0]):
-            if r != s:
-                between += np.sum((centers[r] - centers[s]) ** 2)
-    return float(between / within) if within > 0 else 0.0
+        for s in range(r + 1, centers.shape[0]):
+            between_values.append(np.sum((centers[r] - centers[s]) ** 2))
+    mean_between = float(np.mean(between_values)) if between_values else 0.0
+    mean_within = within / x.shape[0]
+    return float(mean_between / mean_within) if mean_within > 0 else 0.0
+
+
+def cluster_validity_scan(x: np.ndarray, k_values: range = range(2, 6)) -> pd.DataFrame:
+    """Compare FCM validity under different cluster counts."""
+
+    rows = []
+    for k in k_values:
+        fcm_k = FuzzyCMeans(n_clusters=k, m=2, random_state=2026)
+        fcm_k.fit(x)
+        eta_k = cluster_validity(x, fcm_k.U, fcm_k.centers_)
+        cluster_sizes = np.bincount(fcm_k.labels_, minlength=k)
+        rows.append(
+            {
+                "聚类数K": k,
+                "聚类有效性指标eta": eta_k,
+                "最小类样本数": int(cluster_sizes.min()),
+                "是否过度细分": "是" if cluster_sizes.min() < 2 else "否",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def save_results(
@@ -496,6 +541,7 @@ def save_results(
     weak_links_sorted: list[tuple[str, str, float, float]],
     sensitivity_df: pd.DataFrame,
     eta: float,
+    cluster_validity_df: pd.DataFrame,
 ) -> bool:
     """Step 11: save model outputs without touching data-processing files."""
 
@@ -507,6 +553,7 @@ def save_results(
     df_norm.to_csv(PROCESSED_DIR / "problem1_latest_standardized_features.csv", encoding="utf-8-sig")
     sensitivity_df.to_csv(PROCESSED_DIR / "problem1_latest_weight_sensitivity.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame([{"聚类有效性指标eta": eta}]).to_csv(PROCESSED_DIR / "problem1_latest_cluster_validity.csv", index=False, encoding="utf-8-sig")
+    cluster_validity_df.to_csv(PROCESSED_DIR / "problem1_latest_cluster_validity_by_k.csv", index=False, encoding="utf-8-sig")
 
     try:
         with pd.ExcelWriter(TABLE_DIR / "problem1_latest_model_outputs.xlsx", engine="openpyxl") as writer:
@@ -518,6 +565,7 @@ def save_results(
             pd.DataFrame(weak_links_sorted, columns=["景点i", "景点j", "车程(h)", "联动得分"]).to_excel(writer, sheet_name="weak_links", index=False)
             sensitivity_df.to_excel(writer, sheet_name="sensitivity", index=False)
             pd.DataFrame([{"聚类有效性指标eta": eta}]).to_excel(writer, sheet_name="cluster_validity", index=False)
+            cluster_validity_df.to_excel(writer, sheet_name="cluster_validity_by_k", index=False)
     except ModuleNotFoundError:
         print("提示：当前 Python 环境未安装 openpyxl，已跳过 Excel 汇总文件，仅保存 CSV 结果。")
         return False
@@ -585,8 +633,18 @@ def main() -> None:
         print(f"  {link[0]}-{link[1]} 车程{link[2]:.1f}h 得分{link[3]:.3f}")
 
     figure_path = plot_results(df_topsis, df_norm, w_ahp, w_entropy, cols, q33, q67, link_scores, attractions)
-    sensitivity_df, eta = sensitivity_and_validity(norm_data, w_comb, df_topsis, fcm)
-    excel_saved = save_results(df_norm, df_topsis, attractions, cluster_centers, strong_links_sorted, weak_links_sorted, sensitivity_df, eta)
+    sensitivity_df, eta, cluster_validity_df = sensitivity_and_validity(norm_data, w_comb, df_topsis, fcm, cols)
+    excel_saved = save_results(
+        df_norm,
+        df_topsis,
+        attractions,
+        cluster_centers,
+        strong_links_sorted,
+        weak_links_sorted,
+        sensitivity_df,
+        eta,
+        cluster_validity_df,
+    )
 
     print("\n步骤11：结果已保存。")
     if HAS_MATPLOTLIB:
