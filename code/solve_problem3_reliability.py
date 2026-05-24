@@ -44,6 +44,8 @@ FIGURE_DIR = ROOT / "results" / "figures"
 @dataclass(frozen=True)
 class Problem3Config:
     n_sim: int = 10000
+    scenario_n_sim: int = 3000
+    improvement_n_sim: int = 3000
     seed: int = 20260523
     day_start: float = 7.0
     day_end_limit: float = 21.0
@@ -73,6 +75,11 @@ def setup_plot_style() -> None:
 def time_to_hour(value: str) -> float:
     hour, minute = str(value).split(":")
     return int(hour) + int(minute) / 60
+
+
+def hour_to_text(value: float) -> str:
+    minutes = int(round(value * 60))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def is_traffic_peak(hour: float) -> bool:
@@ -290,6 +297,206 @@ def run_simulation(base: pd.DataFrame, cfg: Problem3Config) -> tuple[pd.DataFram
     return result, day_detail, convergence_df, summary_table, daily, contribution
 
 
+def run_scenario_grid(base: pd.DataFrame, cfg: Problem3Config) -> pd.DataFrame:
+    """Evaluate reliability under all traffic/queue disturbance level combinations."""
+
+    levels = [("低", 0.8), ("中", 1.0), ("高", 1.2)]
+    rows: list[dict] = []
+    for traffic_level, traffic_scale in levels:
+        for queue_level, queue_scale in levels:
+            scenario_cfg = Problem3Config(
+                n_sim=cfg.scenario_n_sim,
+                scenario_n_sim=cfg.scenario_n_sim,
+                seed=cfg.seed,
+                day_start=cfg.day_start,
+                day_end_limit=cfg.day_end_limit,
+                reliability_target=cfg.reliability_target,
+                traffic_peak_prob=min(1.0, cfg.traffic_peak_prob * traffic_scale),
+                traffic_off_prob=min(1.0, cfg.traffic_off_prob * traffic_scale),
+                queue_peak_prob=min(1.0, cfg.queue_peak_prob * queue_scale),
+                queue_off_prob=min(1.0, cfg.queue_off_prob * queue_scale),
+            )
+            scenario_result, _, _, _, _, _ = run_simulation(base, scenario_cfg)
+            rows.append(
+                {
+                    "道路扰动水平": traffic_level,
+                    "排队扰动水平": queue_level,
+                    "道路高峰概率": scenario_cfg.traffic_peak_prob,
+                    "道路平峰概率": scenario_cfg.traffic_off_prob,
+                    "排队高峰概率": scenario_cfg.queue_peak_prob,
+                    "排队平峰概率": scenario_cfg.queue_off_prob,
+                    "整体可靠性": scenario_result["是否达标"].mean(),
+                    "游览约束达标率": scenario_result["游览约束达标"].mean(),
+                    "返程约束达标率": scenario_result["返程约束达标"].mean(),
+                }
+            )
+
+    scenario_df = pd.DataFrame(rows)
+    scenario_df["整体可靠性百分比"] = scenario_df["整体可靠性"] * 100
+    return scenario_df
+
+
+def make_single_spot_day(base: pd.DataFrame, day: str, spot_id: str) -> pd.DataFrame:
+    """Create a robust-improvement timeline where one high-risk day keeps only one spot."""
+
+    data = base.copy()
+    other_days = data[data["日期"] != day]
+    day_df = data[data["日期"] == day].copy()
+    prep = day_df.iloc[[0]].copy()
+    visit = day_df[(day_df["环节"] == "景点游览") & (day_df["地点"] == spot_id)].iloc[[0]].copy()
+
+    original_commutes = day_df[day_df["is_commute"]].copy()
+    hotel_to_spot = original_commutes[original_commutes["地点"].str.contains(f"酒店->{spot_id}", regex=False)]
+    spot_to_hotel = original_commutes[original_commutes["地点"].str.contains(f"{spot_id}->酒店", regex=False)]
+
+    if hotel_to_spot.empty and not spot_to_hotel.empty:
+        hotel_to_spot = spot_to_hotel.iloc[[0]].copy()
+        hotel_to_spot["环节"] = "酒店至景点通勤"
+        hotel_to_spot["地点"] = f"酒店->{spot_id}"
+    elif hotel_to_spot.empty:
+        raise ValueError(f"无法构造 {day} 酒店到 {spot_id} 的通勤环节。")
+
+    if spot_to_hotel.empty:
+        spot_to_hotel = hotel_to_spot.iloc[[0]].copy()
+        spot_to_hotel["环节"] = "返程至酒店"
+        spot_to_hotel["地点"] = f"{spot_id}->酒店"
+
+    rebuilt = pd.concat(
+        [
+            prep,
+            hotel_to_spot.iloc[[0]],
+            visit,
+            spot_to_hotel.iloc[[0]],
+        ],
+        ignore_index=True,
+    )
+    result = pd.concat([other_days, rebuilt], ignore_index=True)
+    return result
+
+
+def compress_preparation_time(base: pd.DataFrame, days: set[str] | None = None, ratio: float = 0.8) -> pd.DataFrame:
+    """Use the ±20% fixed-time flexibility to shorten preparation on selected days."""
+
+    data = base.copy()
+    mask = data["环节"].eq("起床早餐与整装")
+    if days is not None:
+        mask &= data["日期"].isin(days)
+    data.loc[mask, "base_dur"] = data.loc[mask, "base_dur"].astype(float) * ratio
+    data.loc[mask, "耗时h"] = data.loc[mask, "base_dur"]
+    return data
+
+
+def build_conservative_single_spot_plan() -> pd.DataFrame:
+    """Build a 90%-target-oriented conservative plan: one spot per day with off-peak entry where possible."""
+
+    attractions = pd.read_csv(PROCESSED_DIR / "attractions_processed.csv", encoding="utf-8-sig").set_index("id")
+    hotel_commute = pd.read_csv(PROCESSED_DIR / "hotel_commute_minutes.csv", index_col=0, encoding="utf-8-sig")
+    plan = [
+        ("第1天", "A1", None),
+        ("第2天", "A5", None),
+        ("第3天", "A3", None),
+        ("第4天", "A7", None),
+        ("第5天", "A10", 12.0),
+    ]
+
+    rows: list[dict] = []
+    for day, spot_id, target_visit_start in plan:
+        spot = attractions.loc[spot_id]
+        current = 7.0
+
+        def append_event(label: str, location: str, duration: float, is_commute: bool, is_visit: bool) -> None:
+            nonlocal current
+            start = current
+            end = current + duration
+            rows.append(
+                {
+                    "日期": day,
+                    "环节": label,
+                    "地点": location,
+                    "开始时间": hour_to_text(start),
+                    "结束时间": hour_to_text(end),
+                    "耗时h": duration,
+                    "base_start": start,
+                    "base_end": end,
+                    "base_dur": duration,
+                    "spot_id": spot_id if is_visit else None,
+                    "min_visit_h": float(spot["min_time"]) if is_visit else 0.0,
+                    "close_h": float(spot["effective_open_end"]) if is_visit else 24.0,
+                    "traffic_period": "高峰" if is_traffic_peak(start) else "平峰",
+                    "queue_period": "高峰" if is_queue_peak(start) else "平峰",
+                    "is_commute": is_commute,
+                    "is_visit": is_visit,
+                }
+            )
+            current = end
+
+        append_event("起床早餐与整装", "酒店", 1.2, False, False)
+        commute_h = float(hotel_commute.loc["酒店", spot_id]) / 60.0
+        append_event("酒店至景点通勤", f"酒店->{spot_id}", commute_h, True, False)
+
+        desired_start = max(float(spot["effective_open_start"]), current)
+        if target_visit_start is not None:
+            desired_start = max(desired_start, target_visit_start)
+        if desired_start > current:
+            append_event("机动缓冲/错峰等待", f"{spot_id}周边", desired_start - current, False, False)
+
+        append_event("景点游览", spot_id, float(spot["comfort_time"]), False, True)
+        append_event("返程至酒店", f"{spot_id}->酒店", commute_h, True, False)
+        append_event("正餐", "酒店/周边", 1.0, False, False)
+
+    return pd.DataFrame(rows)
+
+
+def run_robust_improvement_analysis(base: pd.DataFrame, cfg: Problem3Config) -> pd.DataFrame:
+    """旁路模拟：评估若干不覆盖基准方案的稳健改进建议。"""
+
+    # These plans are reported as side recommendations. The original P1 baseline
+    # remains the comparison anchor so problem two outputs stay traceable.
+    plans = [
+        ("基准方案", "原问题二 P1 行程，不做调整。", base),
+        ("全程准备压缩20%", "利用固定耗时±20%弹性，将每日起床早餐与整装由1.5h压缩为1.2h。", compress_preparation_time(base)),
+        ("第5天仅游览A5", "将最高风险的第5天拆分为单景点日，仅保留民俗古村 A5，减少闭园压力。", make_single_spot_day(base, "第5天", "A5")),
+        ("第5天仅游览A1", "将最高风险的第5天拆分为单景点日，仅保留古城老街 A1，减少连续游览风险。", make_single_spot_day(base, "第5天", "A1")),
+        ("90%目标保守方案", "每日仅安排1个景点，优先选择全天开放或闭园较晚景点，并对A10采用12:00后错峰入园。", build_conservative_single_spot_plan()),
+    ]
+
+    rows: list[dict] = []
+    for idx, (name, description, plan_base) in enumerate(plans):
+        plan_cfg = Problem3Config(
+            n_sim=cfg.improvement_n_sim,
+            scenario_n_sim=cfg.scenario_n_sim,
+            improvement_n_sim=cfg.improvement_n_sim,
+            seed=cfg.seed + 1000 + idx,
+            day_start=cfg.day_start,
+            day_end_limit=cfg.day_end_limit,
+            reliability_target=cfg.reliability_target,
+            traffic_peak_prob=cfg.traffic_peak_prob,
+            traffic_off_prob=cfg.traffic_off_prob,
+            queue_peak_prob=cfg.queue_peak_prob,
+            queue_off_prob=cfg.queue_off_prob,
+        )
+        result, _, _, summary, daily, _ = run_simulation(plan_base, plan_cfg)
+        rows.append(
+            {
+                "改进方案": name,
+                "方案说明": description,
+                "模拟次数": plan_cfg.n_sim,
+                "整体可靠度": float(summary.loc[summary["指标"] == "整体可靠度", "数值"].iloc[0]),
+                "游览约束达标率": float(summary.loc[summary["指标"] == "游览约束达标率", "数值"].iloc[0]),
+                "返程约束达标率": float(summary.loc[summary["指标"] == "返程约束达标率", "数值"].iloc[0]),
+                "第5天失败率": float(daily.loc[daily["日期"] == "第5天", "每日失败率"].iloc[0]),
+                "平均道路总延误h": float(result["道路总延误h"].mean()),
+                "平均排队总延误h": float(result["排队总延误h"].mean()),
+            }
+        )
+
+    comparison = pd.DataFrame(rows)
+    baseline = float(comparison.loc[comparison["改进方案"] == "基准方案", "整体可靠度"].iloc[0])
+    comparison["相对基准提升百分点"] = (comparison["整体可靠度"] - baseline) * 100
+    comparison["整体可靠度百分比"] = comparison["整体可靠度"] * 100
+    return comparison
+
+
 def save_outputs(
     result: pd.DataFrame,
     day_detail: pd.DataFrame,
@@ -297,6 +504,8 @@ def save_outputs(
     summary: pd.DataFrame,
     daily: pd.DataFrame,
     contribution: pd.DataFrame,
+    scenario_grid: pd.DataFrame,
+    improvement: pd.DataFrame,
 ) -> list[Path]:
     outputs = [
         (PROCESSED_DIR / "problem3_detailed_results.csv", result),
@@ -305,6 +514,8 @@ def save_outputs(
         (PROCESSED_DIR / "problem3_simulation_summary.csv", summary),
         (PROCESSED_DIR / "problem3_daily_risk.csv", daily),
         (PROCESSED_DIR / "problem3_disturbance_contribution.csv", contribution),
+        (PROCESSED_DIR / "problem3_reliability_scenario_grid.csv", scenario_grid),
+        (PROCESSED_DIR / "problem3_robust_improvement_comparison.csv", improvement),
     ]
     saved = []
     for path, table in outputs:
@@ -317,6 +528,8 @@ def save_outputs(
             summary.to_excel(writer, sheet_name="summary", index=False)
             daily.to_excel(writer, sheet_name="daily_risk", index=False)
             contribution.to_excel(writer, sheet_name="contribution", index=False)
+            scenario_grid.to_excel(writer, sheet_name="scenario_grid", index=False)
+            improvement.to_excel(writer, sheet_name="robust_improvement", index=False)
             convergence.to_excel(writer, sheet_name="convergence", index=False)
             result.to_excel(writer, sheet_name="detailed_results", index=False)
         saved.append(excel_path)
@@ -443,16 +656,101 @@ def plot_radar(summary: pd.DataFrame, contribution: pd.DataFrame) -> Path | None
     return output
 
 
+def plot_scenario_heatmap(scenario_grid: pd.DataFrame) -> Path | None:
+    """Plot the reliability range under all traffic/queue disturbance combinations."""
+
+    if not HAS_MATPLOTLIB:
+        return None
+    setup_plot_style()
+    traffic_order = ["低", "中", "高"]
+    queue_order = ["低", "中", "高"]
+    matrix = (
+        scenario_grid.pivot(index="道路扰动水平", columns="排队扰动水平", values="整体可靠性百分比")
+        .reindex(index=traffic_order, columns=queue_order)
+    )
+
+    fig, ax = plt.subplots(figsize=(8.8, 6.4))
+    im = ax.imshow(matrix.values, cmap="RdYlGn", vmin=0, vmax=max(25, float(matrix.max().max())))
+    ax.set_xticks(range(len(queue_order)))
+    ax.set_xticklabels(queue_order)
+    ax.set_yticks(range(len(traffic_order)))
+    ax.set_yticklabels(traffic_order)
+    ax.set_xlabel("景点排队扰动水平")
+    ax.set_ylabel("道路堵车扰动水平")
+    ax.set_title("问题三随机扰动组合下的可靠性范围", fontsize=15, fontweight="bold")
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            ax.text(j, i, f"{matrix.iloc[i, j]:.2f}%", ha="center", va="center", color="#111827", fontsize=11)
+
+    fig.colorbar(im, ax=ax, label="整体可靠性/%")
+    fig.text(
+        0.08,
+        0.02,
+        f"关键结论：可靠性范围为 {matrix.min().min():.2f}% - {matrix.max().max():.2f}%，排队和堵车扰动越强，行程越不稳定。",
+        fontsize=11,
+        color="#334155",
+    )
+    output = FIGURE_DIR / "problem3_reliability_scenario_heatmap.png"
+    fig.savefig(output, dpi=260, bbox_inches="tight")
+    plt.close(fig)
+    return output
+
+
+def plot_improvement_comparison(improvement: pd.DataFrame) -> Path | None:
+    """Plot reliability comparison for robust-improvement suggestions."""
+
+    if not HAS_MATPLOTLIB:
+        return None
+    setup_plot_style()
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.8))
+    colors = ["#94A3B8", "#60A5FA", "#34D399", "#F59E0B", "#8B5CF6"]
+
+    axes[0].bar(improvement["改进方案"], improvement["整体可靠度百分比"], color=colors, edgecolor="#334155")
+    axes[0].axhline(90, color="#DC2626", linestyle="--", linewidth=1.5, label="90%可靠度目标")
+    axes[0].set_ylabel("整体可靠度/%")
+    axes[0].set_title("稳健改进建议的整体可靠度对比")
+    axes[0].tick_params(axis="x", rotation=18)
+    axes[0].legend()
+    for idx, value in enumerate(improvement["整体可靠度百分比"]):
+        axes[0].text(idx, value + 1.0, f"{value:.2f}%", ha="center", fontsize=9)
+
+    axes[1].bar(improvement["改进方案"], improvement["第5天失败率"] * 100, color=colors, edgecolor="#334155")
+    axes[1].set_ylabel("第5天失败率/%")
+    axes[1].set_title("最高风险日改进效果对比")
+    axes[1].tick_params(axis="x", rotation=18)
+    for idx, value in enumerate(improvement["第5天失败率"] * 100):
+        axes[1].text(idx, value + 1.0, f"{value:.2f}%", ha="center", fontsize=9)
+
+    fig.suptitle("问题三稳健改进建议方案模拟", fontsize=16, fontweight="bold")
+    fig.text(
+        0.06,
+        0.02,
+        "关键结论：改进方案不替代问题二基准行程，仅用于说明薄弱点优化方向；拆分第5天双景点可显著降低最高风险日失败率。",
+        fontsize=11,
+        color="#334155",
+    )
+    output = FIGURE_DIR / "problem3_robust_improvement_comparison.png"
+    fig.tight_layout(rect=[0, 0.08, 1, 0.92])
+    fig.savefig(output, dpi=260, bbox_inches="tight")
+    plt.close(fig)
+    return output
+
+
 def main() -> None:
     ensure_dirs()
     cfg = Problem3Config()
     base = load_pre_data()
     result, day_detail, convergence, summary, daily, contribution = run_simulation(base, cfg)
-    saved = save_outputs(result, day_detail, convergence, summary, daily, contribution)
+    scenario_grid = run_scenario_grid(base, cfg)
+    improvement = run_robust_improvement_analysis(base, cfg)
+    saved = save_outputs(result, day_detail, convergence, summary, daily, contribution, scenario_grid, improvement)
     for path in [
         plot_dashboard(convergence, summary, daily, contribution, cfg),
         plot_heatmap(daily),
         plot_radar(summary, contribution),
+        plot_scenario_heatmap(scenario_grid),
+        plot_improvement_comparison(improvement),
     ]:
         if path is not None:
             saved.append(path)
@@ -461,6 +759,13 @@ def main() -> None:
     print(summary.to_string(index=False))
     print("\n每日风险：")
     print(daily.round(4).to_string(index=False))
+    print("\n随机扰动组合可靠性范围：")
+    min_reliability = scenario_grid["整体可靠性百分比"].min()
+    max_reliability = scenario_grid["整体可靠性百分比"].max()
+    print(f"R ∈ [{min_reliability:.2f}%, {max_reliability:.2f}%]")
+    print(scenario_grid[["道路扰动水平", "排队扰动水平", "整体可靠性百分比"]].round(2).to_string(index=False))
+    print("\n稳健改进建议方案模拟：")
+    print(improvement[["改进方案", "整体可靠度百分比", "相对基准提升百分点", "第5天失败率"]].round(2).to_string(index=False))
     print("\n文件已保存：")
     for path in saved:
         print(f"- {path}")

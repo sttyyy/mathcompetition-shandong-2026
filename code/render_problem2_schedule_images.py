@@ -61,13 +61,15 @@ def read_csv_utf8(path: Path) -> pd.DataFrame:
 def latest_baseline_itinerary_path() -> Path:
     """Return the newest baseline itinerary CSV, including timestamped fallback files."""
 
+    # Prefer the latest generated itinerary so re-running problem two is reflected
+    # in the rendered figures without changing file names by hand.
     candidates = sorted(
         PROCESSED_DIR.glob("problem2_baseline_itinerary*.csv"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
     if not candidates:
-        raise FileNotFoundError("??? problem2_baseline_itinerary*.csv?????????????")
+        raise FileNotFoundError("找不到 problem2_baseline_itinerary*.csv，请先运行问题二求解脚本。")
     return candidates[0]
 
 
@@ -216,6 +218,102 @@ def render_timeline_gantt(timeline: pd.DataFrame) -> Path:
     return output
 
 
+def render_route_planning_diagram(itinerary: pd.DataFrame) -> Path:
+    """Render a route-style planning diagram for the final 5-day itinerary."""
+
+    required_columns = ["日期", "访问顺序", "景点名称", "行车时间min", "总活动耗时h", "预计回到酒店"]
+    missing = [col for col in required_columns if col not in itinerary.columns]
+    if missing:
+        raise ValueError(f"行程规划图缺少字段：{missing}")
+
+    fig, ax = plt.subplots(figsize=(15.5, 9))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+    ax.set_title("问题二：五日自驾基准行程规划图", fontsize=22, fontweight="bold", pad=18)
+
+    day_colors = ["#D9EAF7", "#E8F3DC", "#FFF1C7", "#FCE1D8", "#EADCF8"]
+    edge_color = "#8AA1B1"
+    text_color = "#1F2937"
+    route_color = "#3B82F6"
+
+    y_positions = [8.2, 6.55, 4.9, 3.25, 1.6]
+    for idx, (_, row) in enumerate(itinerary.iterrows()):
+        y = y_positions[idx]
+        color = day_colors[idx % len(day_colors)]
+        date = str(row["日期"])
+        route_ids = [part.strip() for part in str(row["访问顺序"]).split("->")]
+        route_names = [part.strip() for part in str(row["景点名称"]).split("->")]
+
+        # Day label.
+        ax.text(
+            0.45,
+            y,
+            date,
+            ha="center",
+            va="center",
+            fontsize=15,
+            fontweight="bold",
+            color=text_color,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor=color, edgecolor=edge_color, linewidth=1.2),
+        )
+
+        nodes = ["酒店"] + route_ids + ["酒店"]
+        xs = [1.45]
+        if len(route_ids) == 1:
+            xs += [4.8]
+        else:
+            xs += [3.7, 5.9]
+        xs += [8.7]
+
+        for node_i, (x, node) in enumerate(zip(xs, nodes)):
+            if node == "酒店":
+                label = "酒店"
+                face = "#F8FAFC"
+            else:
+                name_idx = route_ids.index(node)
+                label = f"{node}\n{route_names[name_idx]}"
+                face = color
+            ax.text(
+                x,
+                y,
+                label,
+                ha="center",
+                va="center",
+                fontsize=12,
+                color=text_color,
+                linespacing=1.25,
+                bbox=dict(boxstyle="round,pad=0.45", facecolor=face, edgecolor=edge_color, linewidth=1.2),
+            )
+            if node_i < len(xs) - 1:
+                ax.annotate(
+                    "",
+                    xy=(xs[node_i + 1] - 0.55, y),
+                    xytext=(x + 0.55, y),
+                    arrowprops=dict(arrowstyle="->", color=route_color, lw=2.0, shrinkA=0, shrinkB=0),
+                )
+
+        info = (
+            f"行车 {float(row['行车时间min']):.0f} min  |  "
+            f"活动 {float(row['总活动耗时h']):.1f} h  |  "
+            f"返店 {row['预计回到酒店']}"
+        )
+        ax.text(9.35, y, info, ha="left", va="center", fontsize=11, color="#475569")
+
+    total_drive = itinerary["行车时间min"].astype(float).sum()
+    latest_return = itinerary["预计回到酒店"].iloc[itinerary["预计回到酒店"].map(time_to_hour).argmax()]
+    note = (
+        f"关键结论：5日共优选{int(itinerary['游览景点数'].sum())}个景点，"
+        f"总行车约{total_drive:.0f} min，最晚{latest_return}返店，满足每日1-2个景点和21:00前返程要求。"
+    )
+    ax.text(0.45, 0.45, note, ha="left", va="center", fontsize=12.5, color="#334155")
+
+    output = FIGURE_DIR / "problem2_route_planning_diagram.png"
+    fig.savefig(output, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+    return output
+
+
 def main() -> None:
     setup_style()
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -226,10 +324,12 @@ def main() -> None:
 
     overview_path = render_itinerary_overview(itinerary)
     timeline_path = render_timeline_gantt(timeline)
+    route_path = render_route_planning_diagram(itinerary)
 
     print("已生成图片：")
     print(f"- {overview_path}")
     print(f"- {timeline_path}")
+    print(f"- {route_path}")
 
 
 if __name__ == "__main__":

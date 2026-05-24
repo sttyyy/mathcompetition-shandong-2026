@@ -60,6 +60,7 @@ class Problem2Config:
     seed: int = 20260523
     final_weights: tuple[float, float, float] = (0.45, 0.30, 0.25)
     stable_start_generation: int = 30
+    stability_runs: int = 8
 
 
 def ensure_dirs() -> None:
@@ -383,6 +384,8 @@ def solve_problem2(
 
     history: list[dict] = []
     for generation in range(1, cfg.generations + 1):
+        # Record the current Pareto front before reproduction; the history table
+        # is used only for convergence validation and does not affect selection.
         front = non_dominated_front(population)
         history.append(
             {
@@ -575,6 +578,102 @@ def validate_solution(
     return validation_df, stable_summary
 
 
+def run_weight_sensitivity_validation(pareto_df: pd.DataFrame, cfg: Problem2Config) -> pd.DataFrame:
+    """旁路验证：扰动最终筛选权重，检查锁定 P1 方案是否保持稳定。"""
+
+    base_solution = str(pareto_df.iloc[0]["优选景点"])
+    base_weights = np.asarray(cfg.final_weights, dtype=float)
+    labels = ["满意度权重", "行车权重", "均衡权重"]
+    records: list[dict] = []
+
+    for weight_idx, label in enumerate(labels):
+        for delta in [-0.2, -0.1, 0.0, 0.1, 0.2]:
+            weights = base_weights.copy()
+            weights[weight_idx] = max(0.01, weights[weight_idx] * (1.0 + delta))
+            weights = weights / weights.sum()
+            test_cfg = Problem2Config(
+                final_weights=tuple(float(value) for value in weights),
+                seed=cfg.seed,
+                population_size=cfg.population_size,
+                generations=cfg.generations,
+            )
+            scores = score_for_final_choice(pareto_df, test_cfg)
+            best_pos = int(np.argmax(scores))
+            best = pareto_df.iloc[best_pos]
+            records.append(
+                {
+                    "扰动对象": label,
+                    "扰动幅度": delta,
+                    "满意度权重": weights[0],
+                    "行车权重": weights[1],
+                    "均衡权重": weights[2],
+                    "最优方案编号": best["方案编号"],
+                    "最优景点集合": best["优选景点"],
+                    "最优综合得分": float(scores[best_pos]),
+                    "是否仍为锁定P1": "是" if str(best["优选景点"]) == base_solution else "否",
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
+def run_multi_run_stability_validation(
+    attractions: pd.DataFrame,
+    hotel_commute: pd.DataFrame,
+    commute: pd.DataFrame,
+    locked_solution: str,
+    cfg: Problem2Config,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """旁路验证：多随机种子重复运行，统计景点入选频率和基准方案一致性。"""
+
+    run_records: list[dict] = []
+    attraction_ids = attractions["id"].astype(str).tolist()
+    frequency = {sid: 0 for sid in attraction_ids}
+    locked_set = set(str(locked_solution).split("、"))
+
+    for run_idx in range(1, cfg.stability_runs + 1):
+        run_cfg = Problem2Config(
+            seed=cfg.seed + run_idx * 97,
+            population_size=cfg.population_size,
+            generations=cfg.generations,
+            final_weights=cfg.final_weights,
+        )
+        pareto, _ = solve_problem2(attractions, hotel_commute, commute, run_cfg)
+        run_pareto_df, _, _, _, _ = build_output_tables(pareto, attractions, run_cfg)
+        best = run_pareto_df.iloc[0]
+        selected_ids = str(best["优选景点"]).split("、")
+        selected_set = set(selected_ids)
+        for sid in selected_ids:
+            frequency[sid] += 1
+        run_records.append(
+            {
+                "运行序号": run_idx,
+                "随机种子": run_cfg.seed,
+                "最优方案编号": best["方案编号"],
+                "最优景点集合": best["优选景点"],
+                "综合筛选得分": best["综合筛选得分"],
+                "总喜好度": best["总喜好度"],
+                "总行车时间min": best["总行车时间min"],
+                "日耗时方差": best["日耗时方差"],
+                "是否与锁定P1景点集一致": "是" if selected_set == locked_set else "否",
+            }
+        )
+
+    run_df = pd.DataFrame(run_records)
+    freq_df = pd.DataFrame(
+        [
+            {
+                "景点ID": sid,
+                "景点名称": attractions.set_index("id").loc[sid, "name"],
+                "入选次数": count,
+                "入选频率": count / cfg.stability_runs,
+            }
+            for sid, count in frequency.items()
+        ]
+    ).sort_values(["入选频率", "景点ID"], ascending=[False, True])
+    return run_df, freq_df
+
+
 def save_tables(
     pareto_df: pd.DataFrame,
     itinerary_df: pd.DataFrame,
@@ -626,6 +725,25 @@ def save_tables(
     return saved_files
 
 
+def save_side_validation_outputs(
+    weight_sensitivity: pd.DataFrame,
+    stability_runs: pd.DataFrame,
+    attraction_frequency: pd.DataFrame,
+) -> list[Path]:
+    """保存旁路验证输出，不覆盖主求解结果。"""
+
+    outputs = [
+        (PROCESSED_DIR / "problem2_weight_sensitivity_validation.csv", weight_sensitivity),
+        (PROCESSED_DIR / "problem2_multi_run_stability.csv", stability_runs),
+        (PROCESSED_DIR / "problem2_multi_run_attraction_frequency.csv", attraction_frequency),
+    ]
+    saved: list[Path] = []
+    for path, table in outputs:
+        table.to_csv(path, index=False, encoding="utf-8-sig")
+        saved.append(path)
+    return saved
+
+
 def add_best_value_line(ax, value: float, label: str, color: str) -> None:
     """给收敛曲线添加最优值水平线。"""
 
@@ -673,6 +791,73 @@ def plot_convergence(history_df: pd.DataFrame, cfg: Problem2Config) -> Path | No
 
     output = FIGURE_DIR / "problem2_convergence_analysis.png"
     fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+    return output
+
+
+def plot_weight_sensitivity_validation(weight_sensitivity: pd.DataFrame) -> Path | None:
+    """绘制权重扰动下锁定 P1 稳定性热力图。"""
+
+    if not HAS_MATPLOTLIB:
+        return None
+    setup_plot_style()
+    table = weight_sensitivity.copy()
+    table["保持P1"] = (table["是否仍为锁定P1"] == "是").astype(int)
+    pivot = table.pivot(index="扰动对象", columns="扰动幅度", values="保持P1")
+
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    image = ax.imshow(pivot.values, cmap="YlGn", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels([f"{value:+.0%}" for value in pivot.columns])
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_xlabel("扰动幅度")
+    ax.set_ylabel("扰动对象")
+    ax.set_title("问题二权重敏感性验证：锁定 P1 稳定性", fontsize=15, fontweight="bold")
+    for i in range(pivot.shape[0]):
+        for j in range(pivot.shape[1]):
+            ax.text(j, i, "P1" if pivot.iloc[i, j] == 1 else "变更", ha="center", va="center", color="#111827")
+    fig.colorbar(image, ax=ax, ticks=[0, 1], label="是否保持锁定P1")
+    output = FIGURE_DIR / "problem2_weight_sensitivity_validation.png"
+    fig.savefig(output, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+    return output
+
+
+def plot_multi_run_stability_validation(stability_runs: pd.DataFrame, attraction_frequency: pd.DataFrame) -> Path | None:
+    """绘制多次运行稳定性验证图。"""
+
+    if not HAS_MATPLOTLIB:
+        return None
+    setup_plot_style()
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.8))
+    fig.suptitle("问题二多次运行稳定性验证", fontsize=16, fontweight="bold")
+
+    axes[0].plot(
+        stability_runs["运行序号"],
+        stability_runs["综合筛选得分"],
+        marker="o",
+        linewidth=2,
+        color="#3B82F6",
+        label="综合筛选得分",
+    )
+    axes[0].set_xlabel("运行序号")
+    axes[0].set_ylabel("综合筛选得分")
+    axes[0].set_title("不同随机种子下基准方案得分")
+    axes[0].grid(True, linestyle="--", alpha=0.35)
+    axes[0].legend()
+
+    freq = attraction_frequency.sort_values("入选频率", ascending=True)
+    axes[1].barh(freq["景点ID"] + " " + freq["景点名称"], freq["入选频率"], color="#2A9D8F")
+    axes[1].set_xlim(0, 1.05)
+    axes[1].set_xlabel("入选频率")
+    axes[1].set_title("多次运行中各景点入选频率")
+    for y, value in enumerate(freq["入选频率"]):
+        axes[1].text(value + 0.02, y, f"{value:.0%}", va="center", fontsize=9)
+
+    output = FIGURE_DIR / "problem2_multi_run_stability_validation.png"
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(output, dpi=240, bbox_inches="tight")
     plt.close(fig)
     return output
@@ -1015,6 +1200,43 @@ def main() -> None:
     print("\n步骤4：结果输出与验证")
     pareto_df, itinerary_df, timeline_df, selected_detail, _ = build_output_tables(pareto, attractions, cfg)
     validation_df, convergence_summary = validate_solution(itinerary_df, timeline_df, pareto_df, history_df, cfg)
+
+    print("\n旁路验证：权重敏感性分析与多次运行稳定性验证")
+    locked_solution = str(pareto_df.iloc[0]["优选景点"])
+    # Side validation only: keep the selected P1 itinerary fixed as the formal answer.
+    weight_sensitivity = run_weight_sensitivity_validation(pareto_df, cfg)
+    stability_runs, attraction_frequency = run_multi_run_stability_validation(
+        attractions,
+        hotel_commute,
+        commute,
+        locked_solution,
+        cfg,
+    )
+    weight_stability_rate = (weight_sensitivity["是否仍为锁定P1"] == "是").mean()
+    multi_run_match_rate = (stability_runs["是否与锁定P1景点集一致"] == "是").mean()
+    validation_df = pd.concat(
+        [
+            validation_df,
+            pd.DataFrame(
+                [
+                    {
+                        "检验项目": "权重敏感性分析",
+                        "判定标准": "筛选权重±20%扰动后锁定P1保持稳定",
+                        "实际结果": f"P1保持率 {weight_stability_rate:.0%}",
+                        "是否通过": "通过" if weight_stability_rate >= 0.8 else "需关注",
+                    },
+                    {
+                        "检验项目": "多次运行稳定性验证",
+                        "判定标准": f"{cfg.stability_runs}次不同随机种子运行结果与锁定P1景点集保持一致",
+                        "实际结果": f"一致率 {multi_run_match_rate:.0%}",
+                        "是否通过": "通过" if multi_run_match_rate >= 0.75 else "需关注",
+                    },
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+
     saved_files = save_tables(
         pareto_df,
         itinerary_df,
@@ -1024,7 +1246,14 @@ def main() -> None:
         validation_df,
         convergence_summary,
     )
+    saved_files.extend(save_side_validation_outputs(weight_sensitivity, stability_runs, attraction_frequency))
     figure_files = plot_all_results(pareto_df, itinerary_df, history_df, cfg)
+    for path in [
+        plot_weight_sensitivity_validation(weight_sensitivity),
+        plot_multi_run_stability_validation(stability_runs, attraction_frequency),
+    ]:
+        if path is not None:
+            figure_files.append(path)
     saved_files.extend(figure_files)
 
     best = pareto_df.iloc[0]
